@@ -2,7 +2,7 @@
 opencv-python>=4.5,<5     # code also runs on OpenCV 5 (calibrate.py falls back between cv2.CALIB_* and cv2.fisheye.CALIB_*)
 numpy>=1.24
 
-# Robot integration: nt/warppublish.py, accessRobotTests/, birdseye.publish
+# Robot integration: birdseye.publish, accessRobotTests/, legacy/warppublish.py
 # Keep on the same WPILib year as the robot (2026.x resolved on Python 3.12)
 pyntcore>=2026,<2027
 robotpy-cscore>=2026,<2027

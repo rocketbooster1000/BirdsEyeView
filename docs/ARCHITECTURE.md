@@ -1,215 +1,244 @@
 # BirdsEyeView Architecture
 
-## 1. Purpose and context
+## 1. Purpose and status
 
-BirdsEyeView builds a top-down ("bird's-eye") image of the area around an FRC robot from four fisheye USB cameras, one facing each cardinal direction (North/front, East/right, South/back, West/left). Each camera is unwarped (fisheye undistortion), projected onto the ground plane with a homography, and composited onto a single canvas centred on the robot. The result is meant to be streamed to the driver station via CameraServer/NetworkTables.
+BirdsEyeView builds a top-down ("bird's-eye") image of the area around an FRC robot from four fisheye USB cameras, one facing each cardinal direction (North/front, East/right, South/back, West/left). Each raw fisheye frame is remapped straight onto a robot-centred floor canvas, the four footprints are blended, and the result is streamed to the driver station via cscore (MJPEG) and NetworkTables.
 
-The cameras deliberately do not cover everything. Regions that no camera sees stay black, so the final image shows lit "spotlight" regions (camera coverage) against a dark background (blind spots: the robot body, the diagonal gaps between adjacent cameras, and anything beyond a camera's range).
+The cameras deliberately do not cover everything. Regions that no camera sees stay pure black, so the final image shows lit "spotlight" regions (camera coverage) against a dark background (blind spots: the robot body and a ring around it, the far diagonal corners, and anything beyond a camera's range).
 
-Status: unfinished. Stage 1 (intrinsic calibration and undistortion) works. Stages 2 to 4 exist only as experiments with placeholder geometry. The intended production entry point, `production/streamlined.py`, is three empty stubs.
+Status: the full pipeline runs end to end offline. Physical cameras are not available yet, so calibration and capture are replaced by:
+
+- the existing shared intrinsics (`calib/intrinsics_shared.json`, reproduced from the checkerboard set `undistort/all`),
+- a pose-based camera model (`config/rig.json`) instead of measured ground homographies,
+- a synthetic fisheye simulator (`birdseye/sim.py`) that renders what each camera would see of a procedural floor with known markers.
+
+Real intrinsics, poses and frames drop in through the same config files and the `FileSource`/`CameraSource` interfaces (see section 10).
+
+To see the current output, run `.venv\Scripts\python production\streamlined.py --source sim --save out.png --headless` and open `out.png` (output images are git-ignored).
 
 ## 2. Pipeline
 
 ```mermaid
 flowchart LR
-    calibImgs["Checkerboard images undistort/all (147)"] --> calibrate["undistort/calibrate.py cv2.fisheye.calibrate"]
-    calibrate -->|"K, D pasted by hand"| undistLib["undistort/undistortlib.py undistort maps"]
-    groundPts["Ground-point correspondences per camera (MISSING)"] --> homog["Per-camera ground homography H"]
-    cams["4 fisheye cams N/E/S/W"] --> capture["Threaded capture (warptest2.CameraThread)"]
-    undistLib --> combinedMap["Combined undistort + H remap per camera (MISSING)"]
-    homog --> combinedMap
-    capture --> remap["cv2.remap to 600x600 canvas"]
-    combinedMap --> remap
-    remap --> blend["Coverage-aware blend, black spotlights"]
-    blend --> publish["CameraServer putVideo / NetworkTables"]
+    calibImgs["undistort/all checkerboards"] --> calibrate["undistort/calibrate.py"]
+    calibrate --> intrJson["calib/intrinsics_shared.json"]
+    intrJson --> maps["geometry.build_maps per camera"]
+    rigJson["config/rig.json: poses + canvas"] --> maps
+    maps --> cov["coverage masks"]
+    cov --> weights["blend.build_weights: feathered, normalised"]
+    sim["sim.SimSource: rendered fisheye frames"] --> sources["FrameSource"]
+    files["sources.FileSource: images or video"] --> sources
+    cams["sources.CameraSource: live cameras"] --> sources
+    sources --> stream["streamlined.compute_final_birdseye"]
+    maps --> stream
+    weights --> stream
+    stream --> out["imshow / PNG / publish.Publisher (cscore + NT)"]
 ```
 
-Today the code runs two disconnected halves: `undistortlib` (stage 1, correct) and the warp/stitch experiments (stages 2 to 3), which mostly skip undistortion and use made-up points. `nt/warppublish.py` (stage 4) publishes one raw, unstitched warped view.
+Everything left of `compute_final_birdseye` is computed once at start-up by `streamlined.Pipeline` (about 0.4 s). Per frame the cost is one `cv2.remap` per camera (raw 1280x720 fisheye to the 600x600 canvas, `CV_16SC2` maps) plus a weighted sum: about 28 ms per frame for four cameras on the development PC (about 34 FPS).
 
 ## 3. File map
 
-Core (stage 1, working):
+Pipeline (maintained, tested):
 
 | File | Role |
 |---|---|
-| `undistort/calibrate.py` | `cv2.fisheye.calibrate` on a 7x10 inner-corner checkerboard from `undistort/all/*.jpg`; prints `DIM`, `K`, `D` |
-| `undistort/undistortlib.py` | Hardcoded `K`/`D` (plus 3 commented older sets), import-time `map1`/`map2`, `undistort`, `crop`, `resize` |
-| `undistort/all`, `try2`, `try3`, `try4`, `charuco`, `example` | Calibration images (`all` is the real set; `charuco` and `try3`/`example` are unused) |
+| `production/streamlined.py` | Entry point. `Pipeline` (per-rig maps and weights), `unwarp`, `transform`, `compute_final_birdseye`, `main()` CLI |
+| `birdseye/calib.py` | `Intrinsics` (`K`, `D`, `dim`, `rms`, `source`), `load_intrinsics`, `save_intrinsics`, `Intrinsics.scaled_to` |
+| `birdseye/rig.py` | `CanvasCfg`, `CameraCfg`, `Rig`, `load_rig`; documents the coordinate conventions |
+| `birdseye/geometry.py` | `pose_to_extrinsics`, `canvas_to_floor`/`floor_to_canvas`, `project_floor_points`, `build_maps` (combined canvas to raw fisheye remap plus coverage), `homography_from_points`, `build_maps_from_homography` |
+| `birdseye/blend.py` | `build_weights` (coverage feathered with `cv2.distanceTransform`, normalised), `blend` (renormalises around missing frames) |
+| `birdseye/sim.py` | Procedural floor texture with `MARKERS`, inverse fisheye renderer `render_camera`, `SimSource`; `python -m birdseye.sim` writes `samples/sim/*.png` |
+| `birdseye/sources.py` | `FrameSource` protocol, `FileSource` (per-camera images or videos), `CameraThread`/`CameraSource` (live capture, untested without hardware) |
+| `birdseye/publish.py` | `Publisher`: cscore MJPEG server plus NT4 client (`server` or `team`), advertises under `/CameraPublisher/<name>` |
+| `config/rig.json` | Canvas and camera poses (see section 5) |
+| `calib/intrinsics_shared.json` | Shared fisheye intrinsics, written by `undistort/calibrate.py` |
+| `samples/sim/{north,east,south,west}.png` | Simulated raw frames for `--source files` demos |
+| `tests/` | pytest suite (section 4) |
+| `pytest.ini`, `requirements.txt`, `requirements-dev.txt` | Test config (registers the `slow` marker) and dependencies |
 
-Experiments (stages 2 and 3, placeholder geometry):
+Calibration (maintained):
 
 | File | Role |
 |---|---|
-| `warptest.py` | Base version: `compute_homography`, `warpPerspective` to 600x600, 90/180/270 point-permutation rotations, per-pixel weight masks, `stitch_views` (commented out) |
-| `undistort/canvastest.py` | `warptest.py` plus `create_canvas`, `place_frame`, `place_frame_masked`, offsets, 1920x1080 canvas |
-| `production/canvastest.py` | Copy of the above plus unused named-point placeholders (unfinished cleanup) |
-| `warptest2.py` | Independent rewrite and the cleanest architecture: `CameraThread`, `precompute_remap`, vectorised masks, `stitch`, `--calibrate` point picker. No undistort, no rotation, 3 sources |
-| `production/streamlined.py` | Target entry point; empty stubs `transform`, `unwarp`, `compute_final_birdseye` |
+| `undistort/calibrate.py` | `calibrate(image_glob, verbose) -> (K, D, DIM, rms, n_ok, n_images)`; CLI saves JSON. 7x10 inner-corner checkerboard |
+| `undistort/undistortlib.py` | Old undistort helper: loads `K`/`D` from the JSON (hardcoded fallback), import-time maps, `undistort`, `crop`, `resize`. Kept for `main.py` |
+| `undistort/all`, `try2`, `try3`, `try4`, `charuco`, `example` | Calibration images (`all` is the real set) |
 
-Robot integration (stage 4):
+Legacy (kept for reference only, not maintained, not fixed; may not run):
 
-| File | Role |
+| File | Was |
 |---|---|
-| `nt/warppublish.py` | `warptest.py` minus undistort, plus NT client and `CameraServer.putVideo`; publishes `warped[0]` |
-| `accessRobotTests/network.py` | Canonical robotpy pattern: cscore capture, `getVideo` sink, `putVideo` output, sizes match |
-| `accessRobotTests/dsnt.py` | NT connectivity check (reads `SmartDashboard/random`) |
+| `legacy/warptest.py` | First homography/stitch experiment (placeholder points, permutation rotation) |
+| `legacy/warptest2.py` | Rewrite with `CameraThread`, `precompute_remap`, `--calibrate` point picker; ideas carried into `birdseye.sources` and `geometry` |
+| `legacy/canvastest_undistort.py` | Was `undistort/canvastest.py`: `warptest.py` plus canvas placement |
+| `legacy/canvastest_production.py` | Was `production/canvastest.py`: copy of the above with placeholder points |
+| `legacy/warppublish.py` | Was `nt/warppublish.py`: published one unstitched warped view; replaced by `birdseye.publish` |
 
 Utilities and unrelated:
 
 | File | Role |
 |---|---|
-| `main.py` | Live undistort preview |
-| `scanUtils/scan.py`, `scanUtils/scanPreview.py` | Probe camera indices; list DirectShow device names (useful for pinning N/E/S/W indices) |
+| `main.py` | Live undistort preview of one camera (uses `undistortlib`) |
+| `accessRobotTests/network.py`, `dsnt.py` | robotpy cscore/NT examples and connectivity check |
+| `scanUtils/scan.py`, `scanUtils/scanPreview.py` | Probe camera indices; list DirectShow device names (for pinning N/E/S/W devices) |
 | `stretch.py` | One-off image resize |
 | `nt/soundtest.py`, `nt/soundplaying.py`, `media/` | FRC match-shift timer sound player; not vision |
 
-## 4. How each stage works
+## 4. How to run
 
-### Stage 1: calibration and undistortion
+Environment (Windows, PowerShell; Python 3.12):
 
-- Model: OpenCV fisheye (Kannala-Brandt equidistant), \(r = f\,\theta(1 + k_1\theta^2 + k_2\theta^4 + k_3\theta^6 + k_4\theta^8)\).
-- `calibrate.py` detects corners (adaptive threshold, subpixel refinement), calibrates with `RECOMPUTE_EXTRINSIC | CHECK_COND | FIX_SKEW`, prints the result. Re-running it on `undistort/all` with OpenCV 4.x reproduces the hardcoded `K`/`D` exactly (145 of 147 images detected, RMS 1.088 px).
-- `K`: fx 700.4, fy 702.8, cx 646.7, cy 312.9 (principal point about 47 px above centre). `DIM = (1280, 720)`.
-- `undistortlib.py:16` builds the remap with `Knew = K`. Output is rectilinear 1280x720 but only about 85 x 54 degrees of the raw roughly 114 degree horizontal FOV survive; the image edges are cropped away. `balance=1` would keep about 114 x 81 degrees with curved black borders.
-- The active `D` stops being monotonic at theta of about 70 degrees, so the outermost raw corners cannot be inverted. Harmless with `Knew = K`, but any wider projection must clamp coverage below about 68 degrees (or use the older "alt A" set at `undistortlib.py:9-11`, which stays monotonic to 100 degrees).
-- All four cameras currently share this one `K`/`D`.
-
-### Stage 2: ground-plane homography
-
-- A homography `H` maps 4+ ground points in a camera image to canvas pixels (`cv2.findHomography`, RANSAC). Valid only if (a) the input image is undistorted (rectilinear) and (b) the points really lie on the floor.
-- Old line (`warptest.py`, both `canvastest.py`, `warppublish.py`): `front_src` at `warptest.py:17` has points at y=600, outside every frame these scripts use (640x360 after `resize(undistort(f), 0.5)`, or 640x480 raw). The other cameras reuse the front points (`warptest.py:35-37`). Rotation is done by permuting the destination square (`warptest.py:19`), which rotates about the square's centre (300, 400), not the canvas centre (300, 300).
-- `warptest2.py`: source points fit 640x480 but are identical for all four cameras and the destination squares are only translated (`warptest2.py:58-79`), so every view faces "up". `precompute_remap` (`:137-157`) inverts `H` once and replaces per-frame `warpPerspective` with `cv2.remap`; this is the right idea.
-- No ground-plane calibration data (images, tape measurements, or point lists) exists anywhere in the repo.
-
-### Stage 3: stitching
-
-- `warptest.py`/`canvastest.py`: `stitch_views` with a centre-weighted mask built in per-pixel Python loops; stitching is commented out. `canvastest.py` instead pastes one view onto a 1920x1080 canvas with `place_frame_masked` (black pixels treated as transparent).
-- `warptest2.py`: `precompute_all` builds one remap and one mask per camera, normalises masks by their sum, and `stitch` accumulates `remap(frame) * mask`. Because the masks are identical and ignore coverage, each camera contributes exactly 1/4 everywhere.
-
-### Stage 4: robot publishing
-
-- `nt/warppublish.py:86-101`: `startClient4("my-dashboard")`, `setServer("127.0.0.1")` (local simulator only), `time.sleep(1)` instead of a connection check, `putVideo("Processed", 640, 480)` while frames are 600x600, then `putFrame(warped[0])` (`:165`): one camera, not undistorted, placeholder `H`, not stitched. Uses `CAP_DSHOW` and `cv2.imshow`, so Windows-only and not headless.
-- `accessRobotTests/network.py` is the pattern to copy (cscore capture is cross-platform, sizes match). `nt/soundtest.py:46` suggests team 3006 for `setServerTeam`.
-
-## 5. Canvas layout and spotlights
-
-Intended layout (600x600, robot at the centre, North up):
-
-```
-             far North (wedge)
-        .   [   NORTH view   ]   .
-   [ WEST ]  +--------------+  [ EAST ]
-   [ view ]  |  robot body  |  [ view ]
-   [      ]  |  (blind)     |  [      ]
-        .   [   SOUTH view   ]   .
-             far South (wedge)
-  "." = diagonal gaps between adjacent cameras (blind)
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements-dev.txt
 ```
 
-Where blind spots come from:
+CLI (works from any directory; the script puts the repo root on `sys.path`):
 
-- Each camera sees a bounded wedge of floor: nothing closer than the bottom edge of its frame (the robot body and a ring around it), nothing outside its horizontal FOV, and in practice nothing beyond a useful range. With `Knew = K` the horizontal FOV is about 85 degrees, less than the 90 degrees per quadrant, so the diagonals between adjacent cameras are never seen. These uncovered areas are the spotlight-style dark regions.
-- `cv2.warpPerspective`/`cv2.remap` write 0 (black) wherever a camera has no source pixel. The current blends do not know where each camera has coverage, so they average those black pixels in: uncovered regions are black (correct), but singly covered regions are dimmed (to 25% in `warptest2.py`) and overlaps come out darker. The `1e-6` floor (`warptest.py:77`, `warptest2.py:190`) is only a divide-by-zero guard; it is not the source of the blind spots.
-- With the current placeholder homographies the footprints are unbounded fans wider than the canvas, so the corners overlap instead of staying dark. Measured on `warptest.py` geometry: 39% blind (a square centred at (300, 400)), 50% single coverage, 11% double. `warptest2.py`: all fans open upward, 20% blind along the bottom.
+```powershell
+# One simulated frame, saved, no window
+.venv\Scripts\python production\streamlined.py --source sim --save out.png --headless
 
-Fix: coverage-aware weights. For each camera compute a coverage mask (remap source in bounds, homogeneous `w > 0`, ray angle below the monotonic limit, optional max range), feather it with `cv2.distanceTransform` for smooth seams, multiply, and normalise only where the sum is greater than 0. Uncovered pixels stay black; covered pixels keep full brightness.
+# Per-camera images or videos named <camera>.png / <camera>.mp4 in a directory, live window
+.venv\Scripts\python production\streamlined.py --source files --dir samples\sim --show
 
-## 6. Environment
-
-- Python: original caches are CPython 3.11; 3.12 also works. No requirements file exists and the system Python on the dev machine has none of the packages installed.
-- OpenCV 5.0 breaks `undistort/calibrate.py:8` (`cv2.fisheye.CALIB_*` constants removed). Pin `<5` or switch to `cv2.CALIB_*`. Verified working on OpenCV 4.14.
-- Scripts import `from undistortlib import ...`, which only resolves when run from `undistort/` (or with it on `PYTHONPATH`). `.vscode/settings.json` `extraPaths` affects the editor only.
-
-Proposed requirements (not yet committed as a file):
-
-```text
-# Core vision: fisheye calibration, undistort, homography/stitching
-opencv-python>=4.5,<5     # calibrate.py uses cv2.fisheye.CALIB_* flags removed in OpenCV 5.0
-numpy>=1.24
-
-# Robot integration: nt/warppublish.py, accessRobotTests/
-# Keep on the same WPILib year as the robot (2026.x resolved on Python 3.12)
-pyntcore>=2026,<2027
-robotpy-cscore>=2026,<2027
-
-# Camera enumeration: scanUtils/scanPreview.py (DirectShow)
-pygrabber; sys_platform == "win32"
-
-# Match-timer sound scripts: nt/sound*.py (not part of the vision pipeline; could move to requirements-sound.txt)
-pygame
-playsound==1.2.2          # 1.3.0 is known to fail on Windows
+# Stream to a local NT server (simulator) or to the robot, 100 frames
+.venv\Scripts\python production\streamlined.py --source sim --publish --server 127.0.0.1 --headless --frames 100
+.venv\Scripts\python production\streamlined.py --source files --publish --team 3006 --port 1181 --headless
 ```
 
-`opencv-contrib-python` is not needed (no ArUco/ChArUco code).
+| Flag | Meaning |
+|---|---|
+| `--rig PATH` | Rig JSON (default `config/rig.json`) |
+| `--source sim\|files`, `--dir DIR` | Frame source; `--dir` defaults to `samples/sim` |
+| `--show` | `cv2.imshow` window (Esc or q quits); ignored with `--headless` |
+| `--save PNG` | Write the last canvas |
+| `--publish`, `--server ADDR` or `--team N`, `--port P` | MJPEG stream (port 1180-1190, default first free from 1181) and NT client |
+| `--frames N` | Stop after N frames. Default: 1 frame, unless `--show` or `--publish`, which run until stopped |
+| `--feather PX` | Seam feather width (default 40 px) |
 
-## 7. Known bugs
+FPS and per-frame compute time are logged about once a second. The first `--source sim` frame takes a few seconds because the simulator renders and caches the four views.
 
-Calibration and undistortion:
+Other entry points:
 
-1. `undistort/calibrate.py:8` - `cv2.fisheye.CALIB_*` missing in OpenCV 5.
-2. `undistort/calibrate.py:14` - CWD-relative glob; run from `undistort/` it finds 0 images and then fails with `NameError` on `gray`.
-3. `undistort/calibrate.py:36` - RMS discarded; results are not saved, `K`/`D` must be pasted by hand.
-4. `undistort/undistortlib.py:16,22` - maps built for fixed `DIM=(1280,720)`; `h, w` computed but unused, so other frame sizes are silently mis-mapped.
-5. `undistort/undistortlib.py:41-42` - `crop` takes the top-left corner, not the centre.
-6. `undistort/undistortlib.py:8` - `D` non-monotonic past about 70 degrees (matters only for wider projections).
+```powershell
+.venv\Scripts\python -m birdseye.sim            # regenerate samples/sim/*.png
+.venv\Scripts\python undistort\calibrate.py     # recalibrate, writes calib/intrinsics_shared.json
+```
 
-Homography and stitching:
+Tests:
 
-7. `warptest.py:17,35-37` (same in `nt/warppublish.py:19,37-39`, `undistort/canvastest.py:53,74-76`, `production/canvastest.py:61,82-84`) - placeholder points, y=600 outside the frame, all cameras reuse the front points.
-8. `warptest.py:19-23` (and copies) - rotation pivots around (300, 400), not the canvas centre; `undistort/canvastest.py:56-59` adds a -300 y-shift so the views no longer share a pivot.
-9. `warptest2.py:58-79` - identical `src` for all cameras and translation-only `dst`; no rotation.
-10. `warptest2.py:46` - `CAMERA_SOURCES` has 3 entries for 4 homographies; `zip` at `:211` silently drops RIGHT.
-11. `warptest2.py:160-170,186-191` - masks identical and coverage-unaware; every camera weighted 1/4.
-12. `warptest2.py:151-152` - no guard for `w <= 0` in the perspective divide.
-13. `warptest2.py:102` - `put(None)` can block forever on a full queue; `:119-121` `release()` does not join the thread; `:89` `CAP_DSHOW` cannot open files or URLs despite the docstring.
-14. `warptest2.py:230,264` - `run_calibration` clicks on native-resolution raw frames while `stitch` applies `H` to resized 640x480 frames; it collects no `dst` points and saves nothing.
-15. `warptest2.py:303` - cameras read one after another with no timestamps; no synchronisation.
-16. `warptest.py:51-63` (and copies) - `create_weight_mask` uses per-pixel Python loops; the `numMasks < 4` cache builds 16 masks over the first 4 frames and never checks shape.
-17. `undistort/canvastest.py:84-88`, `production/canvastest.py:92-96` - `warp_to_birdseye` defined twice; the 3-argument version shadows the 2-argument one.
-18. `undistort/canvastest.py:21`, `production/canvastest.py:21` - `fx2 = fy1 + ...` should be `fx1 + ...`; `place_frame` (`:9-12`) does not clip; `place_frame_masked` (`:30`) turns genuinely dark floor into holes.
+```powershell
+.venv\Scripts\python -m pytest                  # everything, about 20 s
+.venv\Scripts\python -m pytest -m "not slow"    # skip the calibration reproduction (about 13 s)
+```
 
-Robot publishing:
+| Test file | Checks |
+|---|---|
+| `test_calibration.py` | JSON round trip, `scaled_to`; (slow) recalibrating `undistort/all` reproduces the stored `K`/`D` (`fx` within 1e-6, 145/147 images) |
+| `test_geometry.py` | Extrinsics orthonormal with correct centre and axis; canvas/floor round trip; every simulated marker lands within 2 px of its expected canvas pixel (stitched and per camera); floor lines stay straight (residual under 1.5 px, position within 2 px), including across overlaps; the homography path reproduces the pose maps |
+| `test_spotlights.py` | Robot centre and diagonal corners have coverage 0 and output exactly 0; all uncovered pixels are 0; weights sum to 1 where covered; single-coverage brightness matches the floor texture (mean ratio within 1 %); overlaps agree between neighbours |
+| `test_robustness.py` | Behind-camera and `theta > theta_max` rejection; coverage respects `max_range_m`; missing frames renormalise; all-missing gives black; low-resolution frames are resized; `unwarp`; `FileSource` with missing files |
+| `test_publish.py` | In-process NT4 server on a non-default port: `Publisher` connects, `put` accepts canvas-size frames and rejects wrong sizes/dtypes, the stream is advertised under `/CameraPublisher/BirdsEye/streams`. Skipped if `ntcore`/`cscore` are missing |
+| `test_cli.py` | `streamlined.py --source sim --save ... --headless` exits 0 from another directory; `main()` with `--source files` matches the in-process result |
 
-19. `nt/warppublish.py:92` - hardwired to `127.0.0.1`; `:96` sleep instead of `isConnected()`.
-20. `nt/warppublish.py:101,165` - declares 640x480, sends 600x600; publishes only `warped[0]`.
-21. `nt/warppublish.py:141-142` - computes `warped_rotate` every frame and discards it.
-22. `nt/warppublish.py:108,160-163` - `CAP_DSHOW` and `cv2.imshow` make it Windows-only and not headless.
+## 5. Coordinate conventions
 
-Structure:
+Defined in `birdseye/rig.py` and used everywhere:
 
-23. `warptest.py:3`, `main.py:2`, `production/canvastest.py:3` - `from undistortlib import ...` fails at runtime from their directories.
-24. All scripts call `main()` at module level without an `if __name__ == "__main__"` guard (for example `warptest2.py:325`, `nt/warppublish.py:182`).
-25. `production/streamlined.py:6` - `unwarp(img, np)` names a parameter `np`, shadowing the usual numpy alias.
+- Robot frame (metres): origin at the robot centre on the floor; +x East (robot right), +y North (robot front), +z up. The floor is z = 0.
+- Camera pose (robot frame): `position_m` (x, y) and `height_m` of the lens; `yaw_deg` heading of the optical axis measured clockwise from North seen from above (N 0, E 90, S 180, W 270); `tilt_deg` downward pitch below horizontal; no roll.
+- Camera frame: OpenCV convention, +x image right, +y image down, +z along the optical axis; `X_cam = R @ X_world + t` (`geometry.pose_to_extrinsics`).
+- Canvas (pixels): North up, East right. Pixel (u, v) is the floor point `x = (u - cx) / px_per_m`, `y = (cy - v) / px_per_m`, with `center_px` defaulting to `((W - 1) / 2, (H - 1) / 2)`.
+- Intrinsics: OpenCV fisheye (Kannala-Brandt), \(r = f\,\theta(1 + k_1\theta^2 + k_2\theta^4 + k_3\theta^6 + k_4\theta^8)\). `DIM` is (width, height); `Intrinsics.scaled_to` rescales `K` for other capture sizes (`D` is resolution independent).
 
-## 8. Gap analysis
+Default rig (`config/rig.json`): 600x600 canvas at 100 px/m (6 x 6 m), robot 0.8 x 0.8 m, cameras centred on each edge at 0.30 m height, tilted 35 degrees down, yaw 0/90/180/270, `theta_max_deg` 68, `max_range_m` 2.5, all sharing `calib/intrinsics_shared.json`. Each entry in `cameras` is merged over `defaults`, so per-camera overrides (intrinsics file, `frame_size`, pose) go in the camera entry.
 
-### Stub-to-code mapping for `production/streamlined.py`
+## 6. How each stage works
 
-| Stub | Intended role | Existing code to reuse | What is missing |
+### Calibration and intrinsics
+
+- `calibrate.py` detects 7x10 corners (adaptive threshold, subpixel refinement) and runs `cv2.fisheye.calibrate` with `RECOMPUTE_EXTRINSIC | CHECK_COND | FIX_SKEW` (flags looked up as `cv2.CALIB_*` with a `cv2.fisheye.CALIB_*` fallback, so OpenCV 4 and 5 both work). On `undistort/all` it finds 145 of 147 boards, RMS 1.088 px, and reproduces the previously hardcoded `K`/`D` exactly.
+- `K`: fx 700.4, fy 702.8, cx 646.7, cy 312.9 (principal point about 47 px above centre), `DIM = (1280, 720)`.
+- The distortion polynomial stops being monotonic at about 70 degrees off-axis, so the outermost raw corners cannot be inverted. The pipeline clamps coverage at `theta_max_deg = 68`.
+
+### Combined remap (`geometry.build_maps`)
+
+For each canvas pixel: canvas to floor (x, y, 0), floor to camera frame with the pose, reject if behind the lens (z <= 0), beyond `theta_max_deg`, beyond `max_range_m` (horizontal distance from the lens) or outside the raw image, otherwise project with the fisheye model to a raw pixel. Rejected pixels map to (-1, -1), which `cv2.remap` with `BORDER_CONSTANT` renders black; the valid set is the camera's coverage mask. There is no intermediate undistorted image, so there is one interpolation and the full field of view is used (the old `Knew = K` undistort kept only about 85 x 54 degrees).
+
+`homography_from_points` is the alternative for measured floor marks: it undistorts the raw image points, fits `H` to their canvas positions, and `build_maps_from_homography` turns it into the same kind of maps (rejecting points behind the lens). A test checks it reproduces the pose maps to under 0.5 px.
+
+### Blending (`blend`)
+
+Each coverage mask is feathered inward with `cv2.distanceTransform` (ramp over `feather_px`), then the weights are normalised only where their sum is above zero. Singly covered pixels get weight exactly 1 (full brightness), overlaps cross-fade, uncovered pixels stay exactly 0. Missing frames (`None`) are dropped and the remaining weights renormalised per pixel, so a neighbour fills the shared overlap and the missing camera's exclusive area goes black.
+
+### Simulator (`sim`)
+
+Works backwards from the raw image: each raw pixel is unprojected (Newton inversion of the distortion polynomial up to its monotonic limit) to a ray, intersected with the floor, and the procedural texture is sampled with trilinear mipmapping. Rays that miss the floor get a sky colour. The floor has a 0.25 m grid (1 m lines heavier, axes white), one colour per quadrant, the robot footprint and 12 magenta markers at known positions (`sim.MARKERS`). The renderer only shares `pose_to_extrinsics` with `build_maps`, so the geometry tests are not circular; markers land within about 0.15 px.
+
+### Sources and publishing
+
+- `FileSource(dir, cameras)` loads `<name>.<image ext>` (returned every read) or `<name>.<video ext>` (advanced per read, looped); missing cameras yield `None`.
+- `CameraSource(devices, cameras, resolution, fps, fourcc="MJPG")` runs one `CameraThread` per camera that keeps only the latest frame with a `time.monotonic()` timestamp, sets FOURCC before resolution, uses `CAP_DSHOW`/`CAP_V4L2` for integer devices and `CAP_ANY` for paths/URLs, drops frames older than `stale_s`, and joins its thread on release.
+- `Publisher(width, height, name, server | team, port, nt_port)` creates the MJPEG server (port 1180-1190) and a `CvSource` at the canvas size, starts an NT4 client on the default instance (so CameraServer advertises the stream), and checks `isConnected()` instead of sleeping.
+
+## 7. Canvas layout and spotlights
+
+With the default rig, 40 % of the canvas is uncovered, 56 % is seen by exactly one camera and 3.5 % by two:
+
+- The robot body and a ring around it are blind (each camera's lower frame edge), as are the far diagonal corners (beyond `max_range_m` and outside the side cameras' FOV). Thin black spikes run diagonally out from the robot corners where adjacent wedges have not yet met.
+- Adjacent cameras overlap along the diagonals around 1.2 m from the centre (the horizontal FOV with the full fisheye is wider than 90 degrees). This is accepted: the blend cross-fades there, and tests check the overlaps agree with each other and with the floor.
+- Uncovered pixels are exactly 0 and covered pixels are full brightness (no dimming), unlike the old blends that averaged black pixels from cameras that could not see the point.
+
+Shape the spotlights through `config/rig.json`: `max_range_m` trims the outer edge, `tilt_deg`/`height_m` move the near edge and the overlap, `theta_max_deg` limits the angular extent.
+
+## 8. Environment
+
+- Python 3.12 in `.venv` (`requirements.txt`, plus `pytest` in `requirements-dev.txt`). Verified with OpenCV 4.14, numpy, pyntcore/robotpy-cscore 2026.2.2.
+- OpenCV is pinned `>=4.5,<5`, but the calibration code also handles the OpenCV 5 flag names.
+- Keep pyntcore/robotpy-cscore on the same WPILib year as the robot.
+- `.venv`, caches and output images (`out*.png`, `outputs/`) are git-ignored.
+
+## 9. Bug status
+
+Bugs found in the original code, with their current status. "Legacy" means the code moved to `legacy/` and was replaced rather than fixed.
+
+| # | Original location | Problem | Status |
 |---|---|---|---|
-| `unwarp(img, np)` | Fisheye undistortion | `undistort/undistortlib.py:16,21-28` (`initUndistortRectifyMap` + `remap`) | Per-camera `K`/`D` loaded from files, not hardcoded; `DIM` tied to actual capture size; ideally folded into the combined map so it is never run as a separate pass |
-| `transform(img, map)` | Apply a precomputed per-camera map (undistort + ground warp) | `warptest2.py:137-157` (`precompute_remap`) and the `cv2.remap` call at `:215-218` | The map must chain fisheye distortion (see below); `w <= 0` guard; a coverage mask returned alongside the map |
-| `compute_final_birdseye(src1..src4)` | Blend 4 warped views onto the robot-centred canvas | `warptest2.py:173-221` (`precompute_all`, `stitch`); robot-frame layout idea from the `dst` squares in `warptest2.py:58-79` | Real per-camera homographies; coverage-aware feathered weights; handling of missing frames (renormalise); robot overlay for the centre |
+| 1 | `undistort/calibrate.py` | `cv2.fisheye.CALIB_*` missing in OpenCV 5 | Fixed (flag lookup with fallback) |
+| 2 | `undistort/calibrate.py` | CWD-relative glob, `NameError` when no images | Fixed (script-relative default, explicit error) |
+| 3 | `undistort/calibrate.py` | RMS discarded, results pasted by hand | Fixed (RMS printed, JSON saved via `birdseye.calib`) |
+| 4 | `undistort/undistortlib.py` | Maps fixed to `DIM` regardless of frame size | Open in `undistortlib` (only used by `main.py`); pipeline handles sizes via `frame_size`/`scaled_to` and `transform` resizing; `streamlined.unwarp` scales to the frame |
+| 5 | `undistort/undistortlib.py` | `crop` takes the top-left corner | Open (only used by `main.py` and legacy) |
+| 6 | intrinsics | `D` non-monotonic past about 70 degrees | Handled (`theta_max_deg = 68` coverage clamp; simulator respects the monotonic limit) |
+| 7 | `warptest.py` and copies | Placeholder points outside the frame, shared by all cameras | Legacy (replaced by pose-based maps and `homography_from_points`) |
+| 8 | `warptest.py` and copies | Rotation pivots around (300, 400) | Legacy (rotation comes from camera yaw) |
+| 9 | `warptest2.py` | Identical `src`, translation-only `dst` | Legacy |
+| 10 | `warptest2.py` | 3 sources for 4 homographies, `zip` drops one | Legacy (`compute_final_birdseye` checks the frame count) |
+| 11 | `warptest2.py` | Coverage-unaware masks, every camera weighted 1/4 | Fixed in `birdseye.blend` |
+| 12 | `warptest2.py` | No `w <= 0` guard | Fixed (`build_maps` rejects z <= 0; homography maps reject w <= 0) |
+| 13 | `warptest2.py` | `put(None)` hang, no join, `CAP_DSHOW` for files | Fixed in `birdseye.sources.CameraThread` |
+| 14 | `warptest2.py` | Click calibration on wrong resolution, saves nothing | Legacy; `homography_from_points` is the fitting half, a click tool is still to be written (section 10) |
+| 15 | `warptest2.py` | Sequential reads, no timestamps | Fixed as far as software allows (threaded capture, timestamps, stale-frame drop); no hardware sync |
+| 16 | `warptest.py` and copies | Per-pixel Python mask loops, unbounded mask cache | Legacy |
+| 17 | both `canvastest.py` | `warp_to_birdseye` defined twice | Legacy |
+| 18 | both `canvastest.py` | `fx2 = fy1 + ...`, unclipped placement, dark floor treated as holes | Legacy |
+| 19 | `nt/warppublish.py` | Hardwired `127.0.0.1`, sleep instead of `isConnected()` | Fixed in `birdseye.publish` (`--server`/`--team`, `wait_connected`) |
+| 20 | `nt/warppublish.py` | Declares 640x480, sends 600x600; one camera only | Fixed (stream declared at canvas size, stitched canvas published) |
+| 21 | `nt/warppublish.py` | Discarded per-frame work | Legacy |
+| 22 | `nt/warppublish.py` | Windows-only capture, `imshow` not headless | Fixed (`--headless`; `CameraSource` picks the backend per platform) |
+| 23 | `warptest.py`, `main.py`, `production/canvastest.py` | `from undistortlib import ...` fails from their directories | Fixed for new code (`birdseye` package, entry points add the repo root to `sys.path`); still open for `main.py` (run it from `undistort/` or with it on `PYTHONPATH`) and legacy |
+| 24 | all scripts | No `__main__` guard | Fixed for `calibrate.py`, `streamlined.py`, `birdseye.sim`; open for legacy and the utility scripts |
+| 25 | `production/streamlined.py` | Parameter named `np` | Fixed |
 
-### Missing pieces
+New in this round: `sim.FloorTexture.sample` failed for more than 32767 points (the `cv2.remap` map size limit); it now folds the points into rows.
 
-1. Per-camera intrinsics. All cameras use one `K`/`D` from one camera. Either calibrate each camera (about 30 to 50 checkerboard views each, covering the corners better than the current set) or verify the lenses are identical by checking each camera's reprojection error against the shared model (under about 1.5 px is acceptable). Persist results to files (for example `calib/cam_N.npz` or YAML), keyed by the physical camera.
-2. Extrinsic / ground-point calibration per camera. No bird's-eye training data exists. Required: for each mounted camera, a set of floor points with known robot-frame coordinates (tape marks or a floor checkerboard measured from the robot centre). Detect or click them in the raw frame, undistort the points with `cv2.fisheye.undistortPoints`, and fit `H` against canvas coordinates computed as `center + scale * (x_robot, y_robot)`. This replaces the permutation-rotation trick: rotation, offset and scale all come from the measured robot-frame coordinates. Alternative: `cv2.solvePnP` on undistorted points to recover each camera's pose and derive `H = Knew [r1 r2 t]`.
-3. Combined undistort + homography remap. For every canvas pixel: apply `H^-1` to get an undistorted pixel, normalise with `Knew^-1` (reject `w <= 0`), then map to a raw fisheye pixel with `cv2.fisheye.distortPoints(pts, K, D)`. Store as `CV_16SC2` maps. One `cv2.remap` per camera per frame then goes straight from raw frame to canvas, avoids double interpolation, and recovers the FOV that `Knew = K` throws away. Clamp coverage below the about 70 degree monotonic limit of `D`.
-4. Synchronised 4-camera capture. Extend `CameraThread`: set resolution and MJPG FOURCC explicitly (4 x 1280x720 YUYV will not fit typical USB bandwidth), keep only the latest frame with a timestamp, fix the `put(None)` hang and join on release, and use a cross-platform backend (cscore `UsbCamera`/`CvSink` or `CAP_V4L2` on a Linux coprocessor). Pin camera identity to direction by device path or name (see `scanUtils/scanPreview.py`), not USB index. Drop or flag frames older than a threshold.
-5. Coverage-aware blending for spotlights (section 5). Precompute per-camera coverage masks once from the combined maps; feather with `distanceTransform`; normalise where the sum is greater than 0; leave the rest black. Optionally clip each wedge to a max range so the spotlight shape is deliberate rather than an artefact of the frame edges.
-6. Requirements file. Commit the block in section 6 as `requirements.txt` (optionally split sound dependencies out). Pin OpenCV `<5` or port `calibrate.py` to `cv2.CALIB_*`.
-7. Robot publishing fixes. Publish the stitched canvas, declare `putVideo` with the canvas size, use `setServerTeam(3006)` (or a CLI flag) with an `isConnected()` check, remove `imshow` in headless mode, and keep MJPEG ports in the FRC-allowed 1180 to 1190 range.
+## 10. Next steps when cameras are available
 
-## 9. Roadmap to finish `streamlined.py`
-
-Ordered so each step is testable before the next.
-
-1. Foundations (small). Add `requirements.txt`; make `undistortlib` importable as a package (or move shared code into `production/`); add `__main__` guards; fix `calibrate.py` to use a script-relative path, print RMS, and save `K`/`D`/`DIM` to a file.
-2. Intrinsics per camera. Capture checkerboard sets from each of the four cameras at the production resolution; calibrate or validate against the shared model; save per-camera files. Load them in `unwarp`.
-3. Ground calibration tool. Build from `warptest2.run_calibration`: open a camera at production resolution, click (or detect) floor marks, enter their robot-frame coordinates, undistort the points, fit `H`, save per-camera JSON. Define the canvas once: size, pixels per inch, robot centre at the canvas centre, North up.
-4. Single-camera end to end. Implement `build_maps(cam_cfg) -> (map1, map2, coverage)` using the combined remap, and `transform(img, maps)` as one `cv2.remap`. Validate with the front camera: straight floor tape must stay straight and measured distances must match the canvas scale.
-5. Four-camera blend. Implement `compute_final_birdseye(frames)` with precomputed coverage-aware feathered weights; verify seams by laying tape lines that cross between adjacent cameras' footprints; verify spotlight regions are black and covered regions are full brightness.
-6. Capture. Replace sequential reads with the fixed `CameraThread` (or cscore sinks), explicit resolution/FOURCC, timestamps, stable device mapping.
-7. Publish. Port the `accessRobotTests/network.py` pattern into `streamlined.py`: NT client to the team, `putVideo("BirdsEye", CANVAS_W, CANVAS_H)`, headless loop, FPS logging.
-8. Cleanup. Retire `warptest.py`, both `canvastest.py` files and `nt/warppublish.py` once `streamlined.py` supersedes them; add an offline test that runs the pipeline on recorded frames from all four cameras.
+1. Per-camera intrinsics. Capture 30 to 50 checkerboard views per camera at the production resolution, covering the image corners. Run `undistort\calibrate.py --images "path\to\north\*.jpg" --out calib\intrinsics_north.json` per camera and set `"intrinsics"` in that camera's entry in `config/rig.json`. If the lenses turn out identical (reprojection error against the shared model under about 1.5 px), keep the shared file. If capture runs at a different size than the calibration, set `"frame_size": [w, h]` so `K` is rescaled.
+2. Real poses. Measure each lens position (x, y from the robot centre), height, yaw and downward tilt and enter them in `config/rig.json`. Verify by laying tape marks at known robot-frame positions and checking where they land on the canvas (the marker and straight-line tests show the method). Small tilt/yaw errors move far points the most, so tune those first.
+3. Homography fallback. If the pose model cannot match (camera roll, lens not centred), collect at least 4 (better 8 or more) floor marks per camera, click them in a raw frame at the production resolution, and fit with `geometry.homography_from_points`; `build_maps_from_homography` gives drop-in maps. This needs a small click tool (salvage the UI from `legacy/warptest2.py`) and a per-camera homography field in the rig JSON that `streamlined.Pipeline` uses instead of `build_maps`.
+4. Device mapping for `CameraSource`. Pin each direction to a physical camera by device name or path, not USB index: `scanUtils/scanPreview.py` lists DirectShow names on Windows; on a Linux coprocessor use `/dev/v4l/by-path/...`. Then `CameraSource({"north": ..., "east": ..., "south": ..., "west": ...}, rig.cameras, resolution=(1280, 720), fourcc="MJPG")`. Add a `--source camera` option (with a device map in the rig JSON or on the command line) to `streamlined.py`; it currently offers `sim` and `files` only. Check that four MJPG streams fit the USB bandwidth.
+5. Recorded regression data. Record a short clip per camera into a directory as `<name>.mp4` and run `--source files --dir ...`; add an offline test on those frames (seam alignment on tape lines, black spotlights, FPS budget).
+6. Spotlight tuning. Adjust `max_range_m`, `tilt_deg`, `theta_max_deg` and `--feather` on real footage; consider a robot outline overlay in the blind centre.
