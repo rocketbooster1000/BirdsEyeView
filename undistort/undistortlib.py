@@ -1,11 +1,23 @@
+import json
+from pathlib import Path
+
 import cv2
 import numpy as np
 
 debug = False
 
+INTRINSICS_PATH = Path(__file__).resolve().parent.parent / "calib" / "intrinsics_shared.json"
+
 DIM=(1280, 720)
 K=np.array([[700.411943374252, 0.0, 646.7195419804588], [0.0, 702.8297076955754, 312.9391328006887], [0.0, 0.0, 1.0]])
 D=np.array([[-0.08069373318016052], [0.004905727970611169], [0.02408389532843681], [-0.02746516791216298]])
+try:
+    _intr = json.loads(INTRINSICS_PATH.read_text())
+    DIM = tuple(int(v) for v in _intr["DIM"])
+    K = np.array(_intr["K"], dtype=np.float64).reshape(3, 3)
+    D = np.array(_intr["D"], dtype=np.float64).reshape(4, 1)
+except (OSError, ValueError, KeyError) as e:
+    print(f"undistortlib: using built-in K/D ({INTRINSICS_PATH} not loaded: {e})")
 # DIM=(1280, 720)
 # K=np.array([[700.5578619832233, 0.0, 645.9530107829912], [0.0, 702.9014182856116, 313.12721313960304], [0.0, 0.0, 1.0]])
 # D=np.array([[-0.08835159712580129], [0.04440595546650344], [-0.03757404870313366], [0.016142337142302704]])

@@ -1,0 +1,17 @@
+{
+  "canvas": {"width": 600, "height": 600, "px_per_m": 100, "center_px": null},
+  "robot": {"size_m": [0.8, 0.8]},
+  "defaults": {
+    "height_m": 0.30,
+    "tilt_deg": 35,
+    "theta_max_deg": 68,
+    "max_range_m": 2.5,
+    "intrinsics": "calib/intrinsics_shared.json"
+  },
+  "cameras": [
+    {"name": "north", "yaw_deg": 0,   "position_m": [0.0, 0.4]},
+    {"name": "east",  "yaw_deg": 90,  "position_m": [0.4, 0.0]},
+    {"name": "south", "yaw_deg": 180, "position_m": [0.0, -0.4]},
+    {"name": "west",  "yaw_deg": 270, "position_m": [-0.4, 0.0]}
+  ]
+}

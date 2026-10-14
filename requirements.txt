@@ -1,0 +1,15 @@
+# Core vision: fisheye calibration, undistort, homography/stitching
+opencv-python>=4.5,<5     # code also runs on OpenCV 5 (calibrate.py falls back between cv2.CALIB_* and cv2.fisheye.CALIB_*)
+numpy>=1.24
+
+# Robot integration: nt/warppublish.py, accessRobotTests/, birdseye.publish
+# Keep on the same WPILib year as the robot (2026.x resolved on Python 3.12)
+pyntcore>=2026,<2027
+robotpy-cscore>=2026,<2027
+
+# Camera enumeration: scanUtils/scanPreview.py (DirectShow)
+pygrabber; sys_platform == "win32"
+
+# Match-timer sound scripts: nt/sound*.py (not part of the vision pipeline; could move to requirements-sound.txt)
+pygame
+playsound==1.2.2          # 1.3.0 is known to fail on Windows
