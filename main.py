@@ -1,12 +1,12 @@
 import cv2 as cv
-from undistortlib import crop, undistort
+from undistort.undistortlib import crop, undistort
 
 stretch_factor_width = 3
 stretch_factor_height = 0.5
 
 # Create a VideoCapture object, 0 for the default camera (built-in webcam)
 # cap = cv.VideoCapture(1, cv.CAP_DSHOW)
-cap = cv.VideoCapture(1, cv.CAP_DSHOW)
+cap = cv.VideoCapture(0, cv.CAP_DSHOW)
 
 cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
